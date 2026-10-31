@@ -74,6 +74,10 @@ CONSTRAINT_STATUS = {
 # 需要报告出来的状态（3 = 完全定义，是唯一健康态）
 BAD_CONSTRAINT = {2, 4, 5, 6, 7}
 
+# 自动修复的图元数上限：超过这个数的草图，AutoDimension2 可能算上几分钟，
+# 实测 15 条图元就要约 9 分钟，所以宁可跳过、让用户手动处理。
+FIX_MAX_SEGMENTS = 10
+
 # 自动标注尺寸的返回码 (swAutodimStatus_e)
 AUTODIM_STATUS = {
     0: "成功", 1: "选项无效", 2: "无活动文档", 3: "文档类型不支持",
@@ -237,6 +241,14 @@ def try_fix_sketch(doc, feat, sketch):
             rc = read(sketch, "AutoDimension2", 1, 1, 1, 1, 1)
         finally:
             _leave()
+        # 关键：改完必须重建模型，否则几何没更新，状态也不可信
+        try:
+            doc.ForceRebuild3(True)
+        except Exception:
+            try:
+                doc.EditRebuild3()
+            except Exception:
+                pass
         after = read(sketch, "GetConstrainedStatus")
         return before, after, AUTODIM_STATUS.get(rc, f"返回码 {rc}")
     except Exception as e:
@@ -496,21 +508,26 @@ def inspect_file(sw, path, do_fix=False):
                     detail = base + ("｜" + diag if diag else "")
 
                     if do_fix and sketch is not None and status == 2:
-                        _b, after, note = try_fix_sketch(doc, feat, sketch)
-                        if after == 3:
-                            detail += "｜已自动修复为完全定义"
-                            result["fixed_count"] += 1
-                        elif after in (4, 5, 6):
-                            detail += (f"｜自动修复后变成「"
-                                       f"{CONSTRAINT_STATUS.get(after, after)}」，不保存")
-                            result["made_worse"] = True
-                        elif after == 2:
-                            if note == "成功":
-                                detail += "｜自动标注返回成功，但草图仍未定形"
-                            else:
-                                detail += f"｜自动修复未成功（{note}）"
+                        seg_n = (diagnose_sketch(sketch) or {}).get("segments", 0)
+                        if seg_n > FIX_MAX_SEGMENTS:
+                            detail += (f"｜图元 {seg_n} 条超过上限 {FIX_MAX_SEGMENTS}，"
+                                       f"跳过自动修复（这类草图 AutoDimension2 会算很久）")
                         else:
-                            detail += f"｜修复后状态 {after}（{note}）"
+                            _b, after, note = try_fix_sketch(doc, feat, sketch)
+                            if after == 3:
+                                detail += "｜已自动修复为完全定义"
+                                result["fixed_count"] += 1
+                            elif after in (4, 5, 6):
+                                detail += (f"｜自动修复后变成「"
+                                           f"{CONSTRAINT_STATUS.get(after, after)}」，不保存")
+                                result["made_worse"] = True
+                            elif after == 2:
+                                if note == "成功":
+                                    detail += "｜自动标注返回成功，但草图仍未定形"
+                                else:
+                                    detail += f"｜自动修复未成功（{note}）"
+                            else:
+                                detail += f"｜修复后状态 {after}（{note}）"
 
                     result["issues"].append({
                         "kind": "underdefined" if status == 2 else "constraint",
@@ -748,6 +765,7 @@ def main():
     parser.add_argument("target", help="要扫描的文件夹或单个 SLDPRT/SLDASM 文件")
     parser.add_argument("--out", default="", help="HTML 报告输出路径（默认不生成）")
     parser.add_argument("--limit", type=int, default=0, help="最多检查几个文件（调试用）")
+    parser.add_argument("--skip", type=int, default=0, help="跳过前 N 个文件（续跑用）")
     parser.add_argument("--deep", action="store_true", help="控制台额外打印每个文件的明细")
     parser.add_argument(
         "--fix", action="store_true",
@@ -768,6 +786,8 @@ def main():
     sw = connect_sw()
 
     files = collect_files(args.target)
+    if args.skip > 0:
+        files = files[args.skip:]
     if args.limit > 0:
         files = files[: args.limit]
     if not files:
@@ -784,11 +804,14 @@ def main():
         print(f"  [{idx}/{len(files)}] {name} ... ", end="", flush=True)
 
         if args.fix:
-            try:
-                shutil.copy2(path, path + ".bak")
-            except Exception as e:
-                print(f"备份失败，跳过（{e}）")
-                continue
+            bak = path + ".bak"
+            # 已有备份说明之前处理过：保留最早那份原始文件，不覆盖
+            if not os.path.exists(bak):
+                try:
+                    shutil.copy2(path, bak)
+                except Exception as e:
+                    print(f"备份失败，跳过（{e}）")
+                    continue
 
         try:
             r = inspect_file(sw, path, do_fix=args.fix)
