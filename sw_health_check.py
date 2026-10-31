@@ -78,6 +78,25 @@ BAD_CONSTRAINT = {2, 4, 5, 6, 7}
 # 实测 15 条图元就要约 9 分钟，所以宁可跳过、让用户手动处理。
 FIX_MAX_SEGMENTS = 10
 
+# 可以被 SW 导入的外部格式
+IMPORT_EXT = (".step", ".stp", ".igs", ".iges", ".x_t", ".x_b", ".sat")
+
+# 实体几何检查失败的错误码 (swFaultEntityErrorCode_e)，IBody2.Check2() 的返回值
+BODY_FAULTS = {
+    0: "无错误",
+    1: "实体损坏", 2: "标识符无效", 3: "实体内外翻转", 4: "区域不一致",
+    5: "边曲线非周期", 6: "边几何非周期", 7: "顶点不在边上", 8: "顶点不在边上（几何）",
+    9: "边方向错误", 10: "边方向错误（几何）", 11: "边曲线超出公差",
+    12: "边曲线超出公差（几何）", 13: "边的顶点相接", 14: "边面顺序错误",
+    15: "边环错误", 16: "面顶点错误", 17: "面边错误", 18: "面边顺序错误",
+    19: "面缺少顶点", 20: "面环错误", 21: "面自相交", 22: "面线框错误",
+    23: "面检查器失败", 24: "面相接不一致", 25: "几何状态自相交",
+    26: "几何退化", 27: "区域壳错误", 28: "壳的拓扑或几何错误",
+    29: "壳相交", 30: "拓扑非 G1 连续", 31: "拓扑超出尺寸框",
+    32: "拓扑状态检查失败", 33: "拓扑状态无几何", 34: "实体状态无效",
+    35: "拓扑缺少几何", 36: "边与边相接",
+}
+
 # 自动标注尺寸的返回码 (swAutodimStatus_e)
 AUTODIM_STATUS = {
     0: "成功", 1: "选项无效", 2: "无活动文档", 3: "文档类型不支持",
@@ -351,13 +370,142 @@ def collect_files(target):
         print(f"  [错误] 路径不存在：{target}")
         sys.exit(1)
 
+    all_ext = (".sldprt", ".sldasm") + IMPORT_EXT
     found = []
     for root, _dirs, names in os.walk(target):
         for n in names:
-            if n.lower().endswith((".sldprt", ".sldasm")):
+            if n.lower().endswith(all_ext):
                 found.append(os.path.join(root, n))
     found.sort()
     return found
+
+
+def _as_list(x):
+    if x is None:
+        return []
+    if isinstance(x, (tuple, list)):
+        return list(x)
+    return [x]
+
+
+def inspect_imported(sw, path):
+    """检查 STEP / IGES 等导入格式。
+
+    这类文件导入 SW 后是没有特征树、没有草图的「哑实体」，
+    所以检查维度和原生零件不同：实体数、是否封闭、几何是否有效。
+    """
+    name = os.path.basename(path)
+    result = {
+        "path": path,
+        "name": name,
+        "type": "导入",
+        "opened": False,
+        "error": None,
+        "feature_count": 0,
+        "sketch_count": 0,
+        "issues": [],
+        "elapsed": 0.0,
+        "fixed_count": 0,
+        "saved": False,
+        "made_worse": False,
+    }
+
+    t0 = time.time()
+    doc = None
+    try:
+        # LoadFile2 是实测唯一能导入 STEP 的入口：
+        # OpenDoc6 返回 None，LoadFile3/LoadFile4 报参数类型不匹配。
+        ok = sw.LoadFile2(path, "")
+    except Exception as e:
+        result["error"] = f"导入失败：{e}"
+        result["elapsed"] = time.time() - t0
+        return result
+
+    if not ok:
+        result["error"] = "导入失败（SOLIDWORKS 返回 False，格式可能损坏）"
+        result["elapsed"] = time.time() - t0
+        return result
+
+    try:
+        doc = sw.ActiveDoc
+    except Exception:
+        doc = None
+    if doc is None:
+        result["error"] = "导入成功但拿不到文档对象"
+        result["elapsed"] = time.time() - t0
+        return result
+
+    result["opened"] = True
+    title = None
+    try:
+        title = read(doc, "GetTitle")
+        solids = [wrap(b) for b in _as_list(read(doc, "GetBodies2", 0, False))]
+        sheets = [wrap(b) for b in _as_list(read(doc, "GetBodies2", 1, False))]
+        result["feature_count"] = len(solids)
+
+        # 收集每个实体的规模，作为报告里的摘要信息
+        shape = []
+        for body in solids + sheets:
+            try:
+                fc = read(body, "GetFaceCount")
+                ec = read(body, "GetEdgeCount")
+                shape.append(f"{fc} 面 / {ec} 边")
+            except Exception:
+                shape.append("规模未知")
+
+        if not solids and not sheets:
+            result["issues"].append({
+                "kind": "error", "feature": "整个文件",
+                "detail": "导入后没有任何实体或曲面（空文件，或只有线框/点）",
+            })
+
+        if sheets:
+            result["issues"].append({
+                "kind": "error",
+                "feature": f"{len(sheets)} 个曲面",
+                "detail": "模型不封闭：只有曲面没有实体，无法直接加工或测量体积",
+            })
+
+        for idx, body in enumerate(solids + sheets):
+            try:
+                code = read(body, "Check2")
+            except Exception:
+                code = None
+            try:
+                fc = read(body, "GetFaceCount")
+                ec = read(body, "GetEdgeCount")
+            except Exception:
+                fc = ec = "?"
+
+            if code:
+                result["issues"].append({
+                    "kind": "error",
+                    "feature": f"实体{idx + 1}（{fc} 面 / {ec} 边）",
+                    "detail": "几何检查失败：" + BODY_FAULTS.get(code, f"错误码 {code}"),
+                })
+
+        # 摘要：让健康的文件也有信息量，而不只是一句 OK
+        parts = [f"{len(solids)} 个实体"]
+        if sheets:
+            parts.append(f"{len(sheets)} 个曲面")
+        if shape:
+            parts.append("（" + "；".join(shape[:3]) + (" 等" if len(shape) > 3 else "") + "）")
+        parts.append("几何检查通过" if not any(
+            i["kind"] == "error" and "几何检查失败" in i["detail"] for i in result["issues"]
+        ) else "几何检查有问题")
+        result["note"] = "".join(parts)
+
+    except Exception:
+        result["error"] = "检查过程中出错：\n" + traceback.format_exc()
+    finally:
+        try:
+            if title:
+                sw.CloseDoc(title)
+        except Exception:
+            pass
+
+    result["elapsed"] = time.time() - t0
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -370,6 +518,11 @@ def inspect_file(sw, path, do_fix=False):
     do_fix=True 时会对欠定义草图尝试自动修复，并在有改善时存盘
     （备份由调用方负责）。
     """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in IMPORT_EXT:
+        # STEP / IGES 等外部格式：哑实体，没有草图可查，走另一套检查
+        return inspect_imported(sw, path)
+
     name = os.path.basename(path)
     ext = os.path.splitext(name)[1].lower()
     is_asm = ext == ".sldasm"
@@ -617,6 +770,14 @@ def render_console(results, deep=False):
                 print(f"  - {r['name']}：{r['error']}")
         print()
 
+    noted = [r for r in results if r.get("note")]
+    if noted:
+        print("  导入文件摘要：")
+        print()
+        for r in noted:
+            print(f"  - {r['name']}：{r['note']}")
+        print()
+
     if deep:
         print("  全部文件明细：")
         print()
@@ -645,6 +806,8 @@ def render_html(results, out_path):
             status = f'<span class="warn">{escape(" / ".join(kinds))}</span>'
         else:
             status = '<span class="ok">正常</span>'
+        if r.get("note"):
+            status += f'<div class="note">{escape(r["note"])}</div>'
 
         detail = ""
         if r["issues"]:
@@ -714,6 +877,7 @@ def render_html(results, out_path):
   .bad {{ color: #d93025; font-weight: 550; }}
   .issues {{ margin: 6px 0 0; padding-left: 18px; color: #4b5563; }}
   .issues li {{ margin: 2px 0; }}
+  .note {{ margin-top: 4px; color: #6b7280; font-size: 12px; }}
   .err {{ margin: 8px 0 0; padding: 8px; background: #fef2f2; border-radius: 6px;
           color: #991b1b; font-size: 12px; white-space: pre-wrap; }}
   .foot {{ margin-top: 20px; color: #9ca3af; font-size: 12px; }}
